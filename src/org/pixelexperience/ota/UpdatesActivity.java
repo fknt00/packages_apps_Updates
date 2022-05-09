@@ -23,18 +23,23 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.util.Log;
+import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.TextView;
 
 import androidx.appcompat.widget.Toolbar;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+import androidx.preference.PreferenceManager;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 import androidx.recyclerview.widget.SimpleItemAnimator;
@@ -47,6 +52,8 @@ import org.pixelexperience.ota.controller.ABUpdateInstaller;
 import org.pixelexperience.ota.controller.UpdaterController;
 import org.pixelexperience.ota.controller.UpdaterService;
 import org.pixelexperience.ota.download.DownloadClient;
+import org.pixelexperience.ota.misc.Constants;
+import org.pixelexperience.ota.misc.PermissionsUtils;
 import org.pixelexperience.ota.misc.Utils;
 import org.pixelexperience.ota.model.UpdateInfo;
 import org.pixelexperience.ota.model.UpdateStatus;
@@ -60,6 +67,19 @@ import static org.pixelexperience.ota.model.UpdateStatus.UNKNOWN;
 public class UpdatesActivity extends UpdatesListActivity {
 
     private static final String TAG = "UpdatesActivity";
+
+    public static final String ACTION_START_DOWNLOAD_WITH_WARNING = "action_start_download_with_warning";
+
+    public static final String ACTION_SHOW_SNACKBAR = "action_show_snackbar";
+    public static final String EXTRA_SNACKBAR_TEXT = "extra_snackbar_text";
+
+    public static final String ACTION_EXPORT_UPDATE = "action_export_update";
+    public static final String EXTRA_UPDATE_NAME = "extra_snackbar_text";
+    public static final String EXTRA_UPDATE_FILE = "extra_update_file";
+
+    private String mExportUpdateName;
+    private File mExportUpdateFile;
+
     private UpdaterService mUpdaterService;
     private BroadcastReceiver mBroadcastReceiver;
 
@@ -90,7 +110,11 @@ public class UpdatesActivity extends UpdatesListActivity {
     @Override
     public void onRequestPermissionsResult(int requestCode,
                                            String[] permissions, int[] grantResults) {
-        mAdapter.onRequestPermissionsResult(requestCode, grantResults);
+        if (grantResults.length > 0 &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED &&
+                requestCode == ExportUpdateService.EXPORT_STATUS_PERMISSION_REQUEST_CODE) {
+            exportUpdate();
+        }
     }
 
     @Override
@@ -99,13 +123,17 @@ public class UpdatesActivity extends UpdatesListActivity {
         setContentView(R.layout.activity_updates);
 
         RecyclerView recyclerView = findViewById(R.id.recycler_view);
-        mAdapter = new UpdatesListAdapter(this);
+        mAdapter = new UpdatesListAdapter();
         recyclerView.setAdapter(mAdapter);
         RecyclerView.LayoutManager layoutManager = new LinearLayoutManager(this);
         recyclerView.setLayoutManager(layoutManager);
         RecyclerView.ItemAnimator animator = recyclerView.getItemAnimator();
         if (animator instanceof SimpleItemAnimator) {
             ((SimpleItemAnimator) animator).setSupportsChangeAnimations(false);
+        }
+
+        if (ABUpdateInstaller.needsReboot()) {
+            return;
         }
 
         mBroadcastReceiver = new BroadcastReceiver() {
@@ -134,13 +162,15 @@ public class UpdatesActivity extends UpdatesListActivity {
                     cleanupUpdates();
                 } else if (ABUpdateInstaller.ACTION_RESTART_PENDING.equals(intent.getAction())) {
                     hideUpdates();
-                    new AlertDialog.Builder(UpdatesActivity.this, R.style.AppTheme_AlertDialogStyle)
-                            .setTitle(R.string.reboot_needed_dialog_title)
-                            .setMessage(R.string.reboot_needed_dialog_summary)
-                            .setPositiveButton(R.string.reboot, (dialog, which) -> Utils.rebootDevice(UpdatesActivity.this))
-                            .setNegativeButton(android.R.string.cancel, null)
-                            .setCancelable(false)
-                            .setOnDismissListener(dialog -> android.os.Process.killProcess(android.os.Process.myPid())).show();
+                    showRestartPendingDialog();
+                } else if (ACTION_START_DOWNLOAD_WITH_WARNING.equals(intent.getAction())) {
+                    startDownloadWithWarning();
+                } else if (ACTION_SHOW_SNACKBAR.equals(intent.getAction())) {
+                    showSnackbar(intent.getStringExtra(EXTRA_SNACKBAR_TEXT), Snackbar.LENGTH_LONG);
+                } else if (ACTION_EXPORT_UPDATE.equals(intent.getAction())) {
+                    mExportUpdateName = intent.getStringExtra(EXTRA_UPDATE_NAME);
+                    mExportUpdateFile = (File) intent.getSerializableExtra(EXTRA_UPDATE_FILE);
+                    exportUpdate();
                 }
             }
         };
@@ -159,8 +189,18 @@ public class UpdatesActivity extends UpdatesListActivity {
         refreshAnimationStart();
     }
 
-    private void handleExportStatusChanged(int status){
-        switch(status){
+    private void showRestartPendingDialog() {
+        new AlertDialog.Builder(UpdatesActivity.this, R.style.AppTheme_AlertDialogStyle)
+                .setTitle(R.string.reboot_needed_dialog_title)
+                .setMessage(R.string.reboot_needed_dialog_summary)
+                .setPositiveButton(R.string.reboot, (dialog, which) -> Utils.rebootDevice(UpdatesActivity.this))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setCancelable(false)
+                .setOnDismissListener(dialog -> finish()).show();
+    }
+
+    private void handleExportStatusChanged(int status) {
+        switch (status) {
             case ExportUpdateService.EXPORT_STATUS_RUNNING:
                 showSnackbar(R.string.dialog_export_title, Snackbar.LENGTH_SHORT);
                 break;
@@ -192,11 +232,13 @@ public class UpdatesActivity extends UpdatesListActivity {
         try {
             Intent intent = new Intent(this, UpdaterService.class);
             startService(intent);
+            if (ABUpdateInstaller.needsReboot()) {
+                showRestartPendingDialog();
+                return;
+            }
             bindService(intent, mConnection, Context.BIND_AUTO_CREATE);
         } catch (IllegalStateException ignored) {
-
         }
-
         IntentFilter intentFilter = new IntentFilter();
         intentFilter.addAction(UpdaterController.ACTION_UPDATE_STATUS);
         intentFilter.addAction(UpdaterController.ACTION_DOWNLOAD_PROGRESS);
@@ -207,6 +249,9 @@ public class UpdatesActivity extends UpdatesListActivity {
         intentFilter.addAction(UpdaterController.ACTION_UPDATE_CLEANUP_DONE);
         intentFilter.addAction(ExportUpdateService.ACTION_EXPORT_STATUS);
         intentFilter.addAction(ABUpdateInstaller.ACTION_RESTART_PENDING);
+        intentFilter.addAction(ACTION_START_DOWNLOAD_WITH_WARNING);
+        intentFilter.addAction(ACTION_SHOW_SNACKBAR);
+        intentFilter.addAction(ACTION_EXPORT_UPDATE);
         LocalBroadcastManager.getInstance(this).registerReceiver(mBroadcastReceiver, intentFilter);
     }
 
@@ -248,6 +293,9 @@ public class UpdatesActivity extends UpdatesListActivity {
     }
 
     private void showUpdates() {
+        if (ABUpdateInstaller.needsReboot()){
+            return;
+        }
         findViewById(R.id.no_new_updates_view).setVisibility(View.GONE);
         findViewById(R.id.recycler_view).setVisibility(View.VISIBLE);
     }
@@ -318,6 +366,9 @@ public class UpdatesActivity extends UpdatesListActivity {
                     if (!cancelled) {
                         showSnackbar(R.string.snack_updates_check_failed, Snackbar.LENGTH_LONG);
                     }
+                    new Handler().postDelayed(() -> {
+                        showUpdates();
+                    }, 1000);
                     refreshAnimationStop();
                 });
             }
@@ -431,8 +482,16 @@ public class UpdatesActivity extends UpdatesListActivity {
         snack.show();
     }
 
-    private void handleABInstallationFailed(){
-        if (Utils.getCurrentUpdateIsIncremental(this) && Utils.shouldUseIncremental(this)){
+    @Override
+    public void showSnackbar(String text, int duration) {
+        Snackbar snack = Snackbar.make(findViewById(R.id.view_snackbar), text, duration);
+        TextView tv = snack.getView().findViewById(com.google.android.material.R.id.snackbar_text);
+        tv.setTextColor(getColor(R.color.text_primary));
+        snack.show();
+    }
+
+    private void handleABInstallationFailed() {
+        if (Utils.getCurrentUpdateIsIncremental(this) && Utils.shouldUseIncremental(this)) {
             new AlertDialog.Builder(this, R.style.AppTheme_AlertDialogStyle)
                     .setTitle(R.string.installing_update_error)
                     .setMessage(R.string.installing_update_ab_disable_incremental_summary)
@@ -443,12 +502,61 @@ public class UpdatesActivity extends UpdatesListActivity {
                             })
                     .setNegativeButton(android.R.string.cancel, null)
                     .show();
-        }else{
+        } else {
             showSnackbar(R.string.installing_update_error, Snackbar.LENGTH_LONG);
         }
     }
 
-    private void cleanupUpdates(){
+    private void startDownloadWithWarning() {
+        UpdaterController updaterController = mUpdaterService.getUpdaterController();
+        if (!Utils.isNetworkAvailable(this)) {
+            updaterController.notifyNetworkUnavailable();
+            return;
+        }
+        SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(this);
+        boolean warn = preferences.getBoolean(Constants.PREF_MOBILE_DATA_WARNING, true);
+        if (Utils.isOnWifiOrEthernet(this) || !warn) {
+            updaterController.startDownload();
+            return;
+        }
+
+        View checkboxView = LayoutInflater.from(this).inflate(R.layout.checkbox_view, null);
+        CheckBox checkbox = checkboxView.findViewById(R.id.checkbox);
+        checkbox.setText(R.string.checkbox_mobile_data_warning);
+
+        new AlertDialog.Builder(this, R.style.AppTheme_AlertDialogStyle)
+                .setTitle(R.string.update_on_mobile_data_title)
+                .setMessage(R.string.update_on_mobile_data_message)
+                .setView(checkboxView)
+                .setPositiveButton(R.string.action_download,
+                        (dialog, which) -> {
+                            if (checkbox.isChecked()) {
+                                preferences.edit()
+                                        .putBoolean(Constants.PREF_MOBILE_DATA_WARNING, false)
+                                        .apply();
+                                supportInvalidateOptionsMenu();
+                            }
+                            updaterController.startDownload();
+                        })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void exportUpdate() {
+        boolean hasPermission = PermissionsUtils.checkAndRequestStoragePermission(
+                this, ExportUpdateService.EXPORT_STATUS_PERMISSION_REQUEST_CODE);
+        if (!hasPermission) {
+            return;
+        }
+        File dest = new File(Utils.getExportPath(), mExportUpdateName);
+        Intent intent = new Intent(this, ExportUpdateService.class);
+        intent.setAction(ExportUpdateService.ACTION_START_EXPORTING);
+        intent.putExtra(ExportUpdateService.EXTRA_SOURCE_FILE, mExportUpdateFile);
+        intent.putExtra(ExportUpdateService.EXTRA_DEST_FILE, dest);
+        startService(intent);
+    }
+
+    private void cleanupUpdates() {
         mAdapter.setDownloadId(null);
         mAdapter.notifyDataSetChanged();
         downloadUpdatesList(false);
